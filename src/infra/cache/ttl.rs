@@ -264,6 +264,49 @@ where
         sample
     }
 
+    /// Collect up to `limit` retained entries whose metadata satisfies
+    /// `predicate`, cloning values only for the matches.
+    ///
+    /// Used by periodic scanners that must not clone the whole cache; callers
+    /// pick candidates and let the next scan handle the remainder.
+    #[inline]
+    pub fn collect_retained_matching(
+        &self,
+        now_ms: u64,
+        limit: usize,
+        predicate: impl Fn(&K, &TtlCacheEntry<V>) -> bool,
+    ) -> Vec<(K, TtlCacheEntry<V>)>
+    where
+        V: Clone,
+    {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        for item in self.map.iter() {
+            if item.value().expire_at_ms <= now_ms {
+                continue;
+            }
+            if !predicate(item.key(), item.value()) {
+                continue;
+            }
+            matches.push((
+                item.key().clone(),
+                TtlCacheEntry {
+                    value: item.value().value.clone(),
+                    cache_time_ms: item.value().cache_time_ms,
+                    expire_at_ms: item.value().expire_at_ms,
+                    last_access_ms: item.value().last_access_ms,
+                },
+            ));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        matches
+    }
+
     /// Snapshot all entries (key + metadata + cloned value).
     #[inline]
     pub fn iter_entries_cloned(&self) -> Vec<(K, TtlCacheEntry<V>)>
@@ -385,6 +428,39 @@ mod tests {
 
         assert!(matches!(status, Some(TtlCacheLookup::Expired)));
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_collect_retained_matching_filters_and_limits() {
+        let cache = TtlCache::with_capacity(8);
+        cache.insert_or_update_with_meta("a", 1u32, 10, 100, 10);
+        cache.insert_or_update_with_meta("b", 2u32, 10, 200, 10);
+        cache.insert_or_update_with_meta("c", 3u32, 10, 300, 10);
+
+        // Expired entries are skipped without consulting the predicate: `a`
+        // expired at t=100ms, so only `b` and `c` remain at t=150ms.
+        let matched = cache.collect_retained_matching(150, 8, |_, entry| entry.value >= 2);
+        assert_eq!(matched.len(), 2);
+
+        // The predicate still filters retained entries.
+        let matched = cache.collect_retained_matching(150, 8, |_, entry| entry.value == 2);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, "b");
+
+        // The limit bounds how many matches are cloned.
+        let matched = cache.collect_retained_matching(50, 1, |_, _| true);
+        assert_eq!(matched.len(), 1);
+
+        assert!(
+            cache
+                .collect_retained_matching(50, 8, |_, _| false)
+                .is_empty()
+        );
+        assert!(
+            cache
+                .collect_retained_matching(50, 0, |_, _| true)
+                .is_empty()
+        );
     }
 
     #[test]

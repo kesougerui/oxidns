@@ -547,6 +547,25 @@ export const enUSPluginDefined = {
           description:
             "Controls whether the ECS scope is included in cache key calculation.",
         },
+        prefetch: {
+          label: "Proactive prefetch",
+          description:
+            "Refresh hot cache entries in the background as they approach expiry so the first request after expiry does not pay the full upstream latency.",
+        },
+        prefetch_before_expire: {
+          label: "Prefetch trigger ratio (%)",
+          description:
+            "Trigger a prefetch when the remaining TTL share is at or below this percentage (the closing window before expiry).",
+        },
+        prefetch_min_hits: {
+          label: "Minimum hits for prefetch",
+          description:
+            "Minimum number of hits for an entry to be considered hot enough to prefetch.",
+        },
+        prefetch_scan_interval: {
+          label: "Prefetch scan interval (seconds)",
+          description: "Prefetch scan period; must be greater than 0.",
+        },
       },
       quickSetup: {
         paramPlaceholder: "short_circuit=true",
@@ -560,6 +579,7 @@ export const enUSPluginDefined = {
           cache_insert_total: "Writes",
           cache_skip_total: "Skipped",
           cache_lazy_refresh_total: "Lazy refresh",
+          cache_prefetch_total: "Prefetch",
           cache_entry_count: "Entries",
         },
         help: {
@@ -576,6 +596,8 @@ export const enUSPluginDefined = {
             "The total number of responses that were skipped from cache due to write policy (truncated responses, no TTL, low positive TTL).",
           cache_lazy_refresh_total:
             "Total number of Lazy Cache background refresh attempts (by result: started / success / failed).",
+          cache_prefetch_total:
+            "Total number of proactive prefetch background refresh attempts (by result: started / success / failed).",
           cache_entry_count: "The number of entries currently in the cache.",
         },
         derived: {

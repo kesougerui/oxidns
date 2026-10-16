@@ -312,6 +312,14 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
     min_positive_ttl: 4
     # Exclude ECS from the cache key for a better hit ratio
     ecs_in_key: false
+    # Prefetch hot entries shortly before they expire
+    prefetch: true
+    # Trigger prefetch once the remaining TTL drops to this share of the TTL
+    prefetch_before_expire: 10
+    # Minimum hits before an entry is considered hot
+    prefetch_min_hits: 3
+    # Prefetch scan interval in seconds
+    prefetch_scan_interval: 5
     # Persist cache contents to disk
     dump_file: "./dns_cache.dump"
     # Periodic dump interval in seconds
@@ -384,6 +392,36 @@ For A/AAAA and other non-CNAME queries, cache admission requires the requested t
 - Type: `boolean`; Required: no; Default: `false`
 - Purpose: Include ECS information in the cache key.
 
+#### `prefetch`
+
+- Type: `boolean`; Required: no; Default: `false`
+- Enables proactive prefetching. A background task scans the cache every `prefetch_scan_interval` seconds and refreshes hot entries that are still fresh but close to their TTL deadline.
+- Behavior:
+  - The next client query hits the refreshed entry, so the first request after expiry no longer pays the full upstream latency.
+  - Disabled by default; when disabled, behavior is identical to a build without this feature.
+  - An entry is prefetched only when all of the following hold: its hit count is at least `prefetch_min_hits`, it is still inside its fresh window, and the remaining share of its TTL is at most `prefetch_before_expire`.
+  - ECS-keyed entries are skipped: the client subnet cannot be recovered from the cache key.
+  - Prefetch shares the in-flight deduplication set and timeout handling with `lazy_cache_ttl` stale refreshes, so one cache key is never refreshed concurrently.
+  - Each scan starts at most 64 refreshes; remaining candidates are picked up by the next scan.
+
+#### `prefetch_before_expire`
+
+- Type: `integer`; Required: no; Default: `10`
+- Range: `1..=99`
+- Upper bound on the remaining TTL (in percent) that makes an entry eligible: it is refreshed during the closing share of its TTL before expiry.
+
+#### `prefetch_min_hits`
+
+- Type: `integer`; Required: no; Default: `3`
+- Minimum number of cache hits before an entry counts as hot enough to prefetch.
+
+#### `prefetch_scan_interval`
+
+- Type: `integer`; Required: no; Default: `5`
+- Unit: seconds
+- Range: greater than `0`
+- Interval between prefetch scans.
+
 ### quick setup
 
 ```yaml
@@ -420,6 +458,7 @@ Exported through the global `GET /api/metrics` endpoint. The cache plugin does n
 - `cache_insert_total`
 - `cache_skip_total{reason="truncated|no_ttl|incomplete_answer|low_positive_ttl"}`
 - `cache_lazy_refresh_total{result="started|success|failed"}`
+- `cache_prefetch_total{result="started|success|failed"}`
 - `cache_entry_count`
 
 ### Typical Uses

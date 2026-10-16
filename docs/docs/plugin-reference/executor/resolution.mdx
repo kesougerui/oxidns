@@ -360,6 +360,14 @@ import Admonition from "@theme/Admonition";
     min_positive_ttl: 4
     # ECS 不参与缓存键，提升命中率
     ecs_in_key: false
+    # 接近过期时主动预取热门条目
+    prefetch: true
+    # 剩余 TTL 占比不高于该百分比时触发预取
+    prefetch_before_expire: 10
+    # 触发预取所需的最小命中次数
+    prefetch_min_hits: 3
+    # 预取扫描周期，单位秒
+    prefetch_scan_interval: 5
     # 启用缓存持久化
     dump_file: "./dns_cache.dump"
     # 定期落盘周期，单位秒
@@ -438,6 +446,36 @@ import Admonition from "@theme/Admonition";
 - 类型：`boolean`；必填：否；默认值：`false`
 - 作用：控制 ECS scope 是否参与缓存键计算。
 
+#### `prefetch`
+
+- 类型：`boolean`；必填：否；默认值：`false`
+- 作用：开启主动预取。开启后由后台任务按 `prefetch_scan_interval` 周期扫描缓存，对"仍处于 fresh 但已接近 TTL 截止"的热门条目提前刷新。
+- 运行影响：
+  - 预取让下一次客户端查询直接命中刷新后的条目，过期后的首个请求不再承担完整上游延迟。
+  - 默认关闭；关闭时行为与未引入该功能时完全一致。
+  - 只有同时满足以下条件的条目会被预取：命中次数不低于 `prefetch_min_hits`、仍在 fresh 窗口内、剩余 TTL 占比不高于 `prefetch_before_expire`。
+  - 带 ECS 的条目不预取：其客户端子网无法从缓存键还原。
+  - 预取与 `lazy_cache_ttl` 的 stale 刷新共用在途去重集合与超时控制，同一缓存键不会并发重复刷新。
+  - 每轮扫描最多启动 64 次刷新，未处理完的候选留到下一轮。
+
+#### `prefetch_before_expire`
+
+- 类型：`integer`；必填：否；默认值：`10`
+- 取值范围：`1..=99`
+- 作用：定义触发预取时允许剩余的最大 TTL 占比（百分比），即条目在过期前的最后这一段窗口内被刷新。
+
+#### `prefetch_min_hits`
+
+- 类型：`integer`；必填：否；默认值：`3`
+- 作用：定义条目被判定为热门所需的命中次数阈值。
+
+#### `prefetch_scan_interval`
+
+- 类型：`integer`；必填：否；默认值：`5`
+- 单位：秒
+- 取值范围：大于 `0`
+- 作用：定义预取扫描周期。
+
 ### quick setup
 
 ```yaml
@@ -479,6 +517,7 @@ import Admonition from "@theme/Admonition";
 - `cache_insert_total`
 - `cache_skip_total{reason="truncated|no_ttl|incomplete_answer|low_positive_ttl"}`
 - `cache_lazy_refresh_total{result="started|success|failed"}`
+- `cache_prefetch_total{result="started|success|failed"}`
 - `cache_entry_count`
 
 ### 典型用途

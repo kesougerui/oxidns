@@ -322,6 +322,7 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         cache_insert_total: "写入",
         cache_skip_total: "跳过",
         cache_lazy_refresh_total: "懒刷新",
+        cache_prefetch_total: "预取",
         cache_entry_count: "条目数",
       },
       metricHelp: {
@@ -335,6 +336,8 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
           "因写入策略（截断响应、无 TTL、正响应 TTL 过低）而跳过缓存的响应总数。",
         cache_lazy_refresh_total:
           "Lazy Cache 后台刷新尝试总数（按结果：started / success / failed）。",
+        cache_prefetch_total:
+          "主动预取后台刷新尝试总数（按结果：started / success / failed）。",
         cache_entry_count: "当前缓存中的条目数量。",
       },
       cardPriority: [
@@ -431,6 +434,39 @@ export const executorPluginDefinitions: PluginKindDefinition[] = [
         label: "ECS 参与缓存键",
         type: "switch",
         default: false,
+        advanced: true,
+      },
+      {
+        key: "prefetch",
+        description:
+          "接近过期时主动刷新热门缓存条目，避免过期后首个请求承担完整上游延迟。",
+        label: "主动预取",
+        type: "switch",
+        default: false,
+      },
+      {
+        key: "prefetch_before_expire",
+        description:
+          "剩余 TTL 占比不高于该百分比时触发预取（即过期前的最后一段窗口）。",
+        label: "预取触发比例(%)",
+        type: "number",
+        default: 10,
+        advanced: true,
+      },
+      {
+        key: "prefetch_min_hits",
+        description: "条目被判为热门、可预取所需的最小命中次数。",
+        label: "预取最小命中次数",
+        type: "number",
+        default: 3,
+        advanced: true,
+      },
+      {
+        key: "prefetch_scan_interval",
+        description: "预取扫描周期，必须大于 0。",
+        label: "预取扫描周期(秒)",
+        type: "number",
+        default: 5,
         advanced: true,
       },
     ],

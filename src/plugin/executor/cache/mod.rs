@@ -6,8 +6,14 @@
 //! Provides an in-memory cache keyed by normalized query name + query context
 //! (qtype/qclass/DO/CD and optional ECS scope). Cache entries expire by TTL and
 //! are periodically cleaned up.
+//!
+//! Two background refresh paths exist on top of the TTL cache:
+//!
+//! - lazy refresh, driven by stale hits, and
+//! - proactive prefetch, driven by the periodic scan in [`prefetch`], which is
+//!   disabled by default and refreshes hot entries before they expire.
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -40,6 +46,11 @@ use crate::{continue_next, plugin_factory};
 mod api;
 mod key;
 mod persistence;
+mod prefetch;
+
+use self::prefetch::{
+    PrefetchSettings, PrefetchTemplate, build_prefetch_query, is_prefetch_eligible,
+};
 
 // Default cache size.
 const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -79,7 +90,7 @@ const EXPIRED_SWEEP_MAX_LIMIT: usize = 65_536;
 const EVICTION_SAMPLE_SIZE: usize = 4096;
 const FULL_TRIM_CACHE_SIZE_LIMIT: usize = 100_000;
 const LARGE_CACHE_EVICTION_MAX_BATCH: usize = 65_536;
-const DEFAULT_LAZY_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
@@ -122,6 +133,31 @@ pub struct CacheConfig {
     ///
     /// Default: false.
     ecs_in_key: Option<bool>,
+
+    /// Whether proactive prefetch of hot entries is enabled.
+    ///
+    /// When enabled, a periodic scan refreshes fresh entries whose TTL is about
+    /// to run out so the next client query is answered from cache.
+    ///
+    /// Default: false (disabled).
+    prefetch: Option<bool>,
+
+    /// Share of the TTL (percent) that may still remain before an entry is
+    /// prefetched; counted back from the deadline.
+    ///
+    /// Default: 10, meaning an entry is refreshed during the last 10% of its
+    /// TTL.
+    prefetch_before_expire: Option<u8>,
+
+    /// Minimum number of cache hits before a domain is prefetched.
+    ///
+    /// Default: 3. Set to 0 to prefetch every eligible entry.
+    prefetch_min_hits: Option<u32>,
+
+    /// Interval (seconds) between prefetch scans.
+    ///
+    /// Default: 5.
+    prefetch_scan_interval: Option<u64>,
 }
 
 type CacheMap = TtlCache<CacheKey, Arc<CacheItem>>;
@@ -140,6 +176,13 @@ pub struct CacheItem {
     /// Whether cache admission or persistence loading has already validated
     /// this response against its query key.
     validation: CacheEntryValidation,
+
+    /// Number of fresh/stale hits observed since this entry was stored.
+    ///
+    /// Shared through `Arc` so the hit path can count hits without taking a
+    /// second lock on the cache map. The counter is only read by the prefetch
+    /// scanner; it is not part of the persisted representation.
+    hits: Arc<AtomicU32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +200,7 @@ impl CacheItem {
             ttl,
             fresh_until_ms,
             validation: CacheEntryValidation::Unknown,
+            hits: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -166,12 +210,25 @@ impl CacheItem {
             ttl,
             fresh_until_ms,
             validation: CacheEntryValidation::Validated,
+            hits: Arc::new(AtomicU32::new(0)),
         }
     }
 
     #[inline]
     fn is_validated(&self) -> bool {
         self.validation == CacheEntryValidation::Validated
+    }
+
+    /// Count one cache hit.
+    #[inline]
+    fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hits observed since this entry was stored.
+    #[inline]
+    fn hits(&self) -> u32 {
+        self.hits.load(Ordering::Relaxed)
     }
 }
 
@@ -192,6 +249,26 @@ enum CacheSkipReason {
 enum CacheTtlDecision {
     Cache(u32),
     Skip(CacheSkipReason),
+}
+
+/// Which background refresh path is being accounted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshKind {
+    /// Refresh triggered by a stale lazy cache hit.
+    Lazy,
+    /// Refresh triggered by the proactive prefetch scan.
+    Prefetch,
+}
+
+/// TTL policy applied to a refreshed response, snapshot from the live config.
+#[derive(Debug, Clone, Copy)]
+struct RefreshPolicy {
+    lazy_cache_ttl: Option<u32>,
+    max_positive_ttl: Option<u32>,
+    min_positive_ttl: Option<u32>,
+    cache_negative: bool,
+    max_negative_ttl: u32,
+    negative_ttl_without_soa: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +302,9 @@ struct CacheMetrics {
     lazy_refresh_started_total: AtomicU64,
     lazy_refresh_success_total: AtomicU64,
     lazy_refresh_failed_total: AtomicU64,
+    prefetch_started_total: AtomicU64,
+    prefetch_success_total: AtomicU64,
+    prefetch_failed_total: AtomicU64,
 }
 
 impl CacheMetrics {
@@ -245,6 +325,25 @@ impl CacheMetrics {
             lazy_refresh_started_total: AtomicU64::new(0),
             lazy_refresh_success_total: AtomicU64::new(0),
             lazy_refresh_failed_total: AtomicU64::new(0),
+            prefetch_started_total: AtomicU64::new(0),
+            prefetch_success_total: AtomicU64::new(0),
+            prefetch_failed_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Counters used by one background refresh path.
+    fn refresh_counters(&self, kind: RefreshKind) -> (&AtomicU64, &AtomicU64, &AtomicU64) {
+        match kind {
+            RefreshKind::Lazy => (
+                &self.lazy_refresh_started_total,
+                &self.lazy_refresh_success_total,
+                &self.lazy_refresh_failed_total,
+            ),
+            RefreshKind::Prefetch => (
+                &self.prefetch_started_total,
+                &self.prefetch_success_total,
+                &self.prefetch_failed_total,
+            ),
         }
     }
 
@@ -394,6 +493,36 @@ impl MetricSource for CacheMetrics {
             &lazy_failed,
             self.lazy_refresh_failed_total.load(Ordering::Relaxed),
         ));
+        let prefetch_started = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("result", "started"),
+        ];
+        sink.emit(MetricSample::counter(
+            "cache_prefetch_total",
+            "Total proactive prefetch attempts by result.",
+            &prefetch_started,
+            self.prefetch_started_total.load(Ordering::Relaxed),
+        ));
+        let prefetch_success = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("result", "success"),
+        ];
+        sink.emit(MetricSample::counter(
+            "cache_prefetch_total",
+            "Total proactive prefetch attempts by result.",
+            &prefetch_success,
+            self.prefetch_success_total.load(Ordering::Relaxed),
+        ));
+        let prefetch_failed = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("result", "failed"),
+        ];
+        sink.emit(MetricSample::counter(
+            "cache_prefetch_total",
+            "Total proactive prefetch attempts by result.",
+            &prefetch_failed,
+            self.prefetch_failed_total.load(Ordering::Relaxed),
+        ));
         sink.emit(MetricSample::gauge(
             "cache_entry_count",
             "Current number of cache entries.",
@@ -450,7 +579,22 @@ pub struct Cache {
     /// Periodic cleanup task handle.
     cleanup_task_handle: Mutex<Option<task_center::ManagedTaskHandle>>,
 
-    /// Deduplicates background refreshes for stale lazy cache hits.
+    /// Resolved prefetch settings; `None` disables the prefetch scanner.
+    prefetch: Option<PrefetchSettings>,
+
+    /// Periodic prefetch task handle, present when prefetch is enabled.
+    prefetch_task_handle: Mutex<Option<task_center::ManagedTaskHandle>>,
+
+    /// Ingress template captured from the first request, reused by prefetch.
+    prefetch_template: Arc<OnceLock<PrefetchTemplate>>,
+
+    /// Downstream executor chain captured from the first request.
+    ///
+    /// The chain program is static for a given sequence, so capturing it once is
+    /// enough to drive prefetch refreshes outside a client request.
+    prefetch_next: Arc<OnceLock<ExecutorNext>>,
+
+    /// Deduplicates background refreshes for stale lazy cache hits and prefetch.
     lazy_refresh_inflight: Arc<Mutex<AHashSet<CacheKey>>>,
 
     /// Next timestamp when an inline write-side maintenance pass may run.
@@ -549,6 +693,77 @@ impl Cache {
                         warn!(
                             "LRU eviction: removed {} items, cache size {} -> {}",
                             stats.evicted, stats.before_len, stats.after_len
+                        );
+                    }
+                }
+            },
+        )
+    }
+
+    /// Spawn the periodic prefetch scan.
+    ///
+    /// The scan is a no-op until a request has been observed: prefetch needs the
+    /// downstream executor chain of a real request to drive refreshes, so the
+    /// task waits for the captured template instead of failing initialization.
+    fn spawn_prefetch_task(
+        &self,
+        cache_map: CacheMap,
+        settings: PrefetchSettings,
+        template: Arc<OnceLock<PrefetchTemplate>>,
+        next_template: Arc<OnceLock<ExecutorNext>>,
+    ) -> Result<task_center::ManagedTaskHandle> {
+        let metrics = self.metrics.clone();
+        let inflight = self.lazy_refresh_inflight.clone();
+        let updated_keys = self.updated_keys.clone();
+        let policy = self.refresh_policy();
+
+        task_center::spawn_fixed(
+            format!("cache:{}:prefetch", self.tag),
+            Duration::from_secs(settings.scan_interval_secs),
+            task_center::TaskOptions::default(),
+            move |_| {
+                let cache_map = cache_map.clone();
+                let metrics = metrics.clone();
+                let inflight = inflight.clone();
+                let updated_keys = updated_keys.clone();
+                let template = template.clone();
+                let next_template = next_template.clone();
+
+                async move {
+                    let Some(next) = next_template.get().cloned() else {
+                        return;
+                    };
+                    let Some(template) = template.get() else {
+                        return;
+                    };
+
+                    let now = AppClock::elapsed_millis();
+                    let candidates = cache_map.collect_retained_matching(
+                        now,
+                        settings.max_per_scan,
+                        |_, entry| is_prefetch_eligible(entry.value.as_ref(), now, &settings),
+                    );
+
+                    for (key, entry) in candidates {
+                        let Some(query) = build_prefetch_query(&key) else {
+                            continue;
+                        };
+                        let identity = CacheEntryIdentity {
+                            value: entry.value.clone(),
+                            cache_time_ms: entry.cache_time_ms,
+                            expire_at_ms: entry.expire_at_ms,
+                        };
+                        Cache::start_refresh(
+                            cache_map.clone(),
+                            metrics.clone(),
+                            inflight.clone(),
+                            updated_keys.clone(),
+                            key,
+                            Some(identity),
+                            template.context_for(query),
+                            next.clone(),
+                            RefreshKind::Prefetch,
+                            policy,
                         );
                     }
                 }
@@ -886,6 +1101,7 @@ impl Cache {
                     }
                 } else if now < item.value.fresh_until_ms {
                     self.metrics.fresh_hit_total.fetch_add(1, Ordering::Relaxed);
+                    item.value.record_hit();
                     let remaining_ttl = item
                         .value
                         .fresh_until_ms
@@ -919,6 +1135,7 @@ impl Cache {
                         expire_at_ms: item.expire_at_ms,
                     };
                     self.metrics.stale_hit_total.fetch_add(1, Ordering::Relaxed);
+                    item.value.record_hit();
                     let resp = Self::restore_cached_message(
                         &item.value,
                         context.request.id(),
@@ -1125,6 +1342,19 @@ impl Cache {
         self.maybe_prune_after_insert(cache_map, now);
     }
 
+    /// TTL policy snapshot for background refreshes.
+    fn refresh_policy(&self) -> RefreshPolicy {
+        RefreshPolicy {
+            lazy_cache_ttl: self.config.lazy_cache_ttl,
+            max_positive_ttl: self.config.max_positive_ttl,
+            min_positive_ttl: self.config.min_positive_ttl,
+            cache_negative: self.cache_negative,
+            max_negative_ttl: self.max_negative_ttl,
+            negative_ttl_without_soa: self.negative_ttl_without_soa,
+        }
+    }
+
+    /// Refresh triggered by a stale lazy cache hit.
     fn try_start_lazy_refresh(
         &self,
         key: &CacheKey,
@@ -1137,36 +1367,59 @@ impl Cache {
             return;
         };
 
+        let mut sub_ctx = context.copy_for_subquery();
+        sub_ctx.clear_response();
+        Self::start_refresh(
+            cache_map.clone(),
+            self.metrics.clone(),
+            self.lazy_refresh_inflight.clone(),
+            self.updated_keys.clone(),
+            key.clone(),
+            Some(refresh_entry.clone()),
+            sub_ctx,
+            next,
+            RefreshKind::Lazy,
+            self.refresh_policy(),
+        );
+    }
+
+    /// Shared background refresh used by lazy refresh and prefetch.
+    ///
+    /// The in-flight set deduplicates refreshes per cache key, so a prefetch and
+    /// a stale hit cannot refresh one entry twice concurrently.
+    #[allow(clippy::too_many_arguments)]
+    fn start_refresh(
+        cache_map: CacheMap,
+        metrics: Arc<CacheMetrics>,
+        inflight: Arc<Mutex<AHashSet<CacheKey>>>,
+        updated_keys: Arc<AtomicU64>,
+        key: CacheKey,
+        refresh_entry: Option<CacheEntryIdentity>,
+        mut sub_ctx: DnsContext,
+        next: ExecutorNext,
+        kind: RefreshKind,
+        policy: RefreshPolicy,
+    ) {
         {
-            let mut inflight = self
-                .lazy_refresh_inflight
-                .lock()
-                .expect("lazy_refresh_inflight poisoned");
-            if !inflight.insert(key.clone()) {
+            let mut inflight_guard = inflight.lock().expect("lazy_refresh_inflight poisoned");
+            if !inflight_guard.insert(key.clone()) {
                 return;
             }
         }
-        self.metrics
-            .lazy_refresh_started_total
+        metrics
+            .refresh_counters(kind)
+            .0
             .fetch_add(1, Ordering::Relaxed);
 
-        let key = key.clone();
-        let refresh_entry = refresh_entry.clone();
-        let cache_map = cache_map.clone();
-        let inflight = self.lazy_refresh_inflight.clone();
-        let mut sub_ctx = context.copy_for_subquery();
-        sub_ctx.clear_response();
-        let lazy_cache_ttl = self.config.lazy_cache_ttl;
-        let max_positive_ttl = self.config.max_positive_ttl;
-        let min_positive_ttl = self.config.min_positive_ttl;
-        let cache_negative = self.cache_negative;
-        let max_negative_ttl = self.max_negative_ttl;
-        let negative_ttl_without_soa = self.negative_ttl_without_soa;
-        let updated_keys = self.updated_keys.clone();
-        let metrics = self.metrics.clone();
+        let lazy_cache_ttl = policy.lazy_cache_ttl;
+        let max_positive_ttl = policy.max_positive_ttl;
+        let min_positive_ttl = policy.min_positive_ttl;
+        let cache_negative = policy.cache_negative;
+        let max_negative_ttl = policy.max_negative_ttl;
+        let negative_ttl_without_soa = policy.negative_ttl_without_soa;
 
         tokio::spawn(async move {
-            let refresh = tokio::time::timeout(DEFAULT_LAZY_REFRESH_TIMEOUT, async {
+            let refresh = tokio::time::timeout(DEFAULT_REFRESH_TIMEOUT, async {
                 let _ = next.next(&mut sub_ctx).await?;
                 Ok::<Option<Message>, DnsError>(sub_ctx.response().cloned())
             })
@@ -1204,11 +1457,15 @@ impl Cache {
                         updated_keys.fetch_add(1, Ordering::Relaxed);
                         metrics.insert_total.fetch_add(1, Ordering::Relaxed);
                         metrics
-                            .lazy_refresh_success_total
+                            .refresh_counters(kind)
+                            .1
                             .fetch_add(1, Ordering::Relaxed);
                     } else {
                         if let CacheTtlDecision::Skip(reason) = ttl {
+                            // Only lazy refresh owns a previous entry to evict; a
+                            // prefetch refresh has no stale entry to replace.
                             if reason == CacheSkipReason::LowPositiveTtl
+                                && let Some(refresh_entry) = refresh_entry.as_ref()
                                 && cache_map.remove_if(&key, |existing| {
                                     existing.cache_time_ms == refresh_entry.cache_time_ms
                                         && existing.expire_at_ms == refresh_entry.expire_at_ms
@@ -1224,24 +1481,28 @@ impl Cache {
                             metrics.record_skip(reason);
                         }
                         metrics
-                            .lazy_refresh_failed_total
+                            .refresh_counters(kind)
+                            .2
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Ok(Ok(_)) => {
                     metrics
-                        .lazy_refresh_failed_total
+                        .refresh_counters(kind)
+                        .2
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(Err(err)) => {
                     metrics
-                        .lazy_refresh_failed_total
+                        .refresh_counters(kind)
+                        .2
                         .fetch_add(1, Ordering::Relaxed);
                     warn!("lazy cache refresh failed for {}: {}", key.domain, err);
                 }
                 Err(_) => {
                     metrics
-                        .lazy_refresh_failed_total
+                        .refresh_counters(kind)
+                        .2
                         .fetch_add(1, Ordering::Relaxed);
                     warn!("lazy cache refresh timed out for {}", key.domain);
                 }
@@ -1302,7 +1563,8 @@ impl Plugin for Cache {
                 .expect("dump_task_handle poisoned") = Some(task_handle);
         }
 
-        let cleanup_task_handle = match self.spawn_cleanup_task(cache_map, self.cache_size) {
+        let cleanup_task_handle = match self.spawn_cleanup_task(cache_map.clone(), self.cache_size)
+        {
             Ok(handle) => handle,
             Err(error) => {
                 let dump_task_handle = self
@@ -1321,6 +1583,39 @@ impl Plugin for Cache {
             .cleanup_task_handle
             .lock()
             .expect("cleanup_task_handle poisoned") = Some(cleanup_task_handle);
+
+        if let Some(settings) = self.prefetch {
+            let prefetch_task_handle = match self.spawn_prefetch_task(
+                cache_map,
+                settings,
+                self.prefetch_template.clone(),
+                self.prefetch_next.clone(),
+            ) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let handles = [
+                        self.dump_task_handle
+                            .lock()
+                            .expect("dump_task_handle poisoned")
+                            .take(),
+                        self.cleanup_task_handle
+                            .lock()
+                            .expect("cleanup_task_handle poisoned")
+                            .take(),
+                    ];
+                    for handle in handles.into_iter().flatten() {
+                        handle.stop().await;
+                    }
+                    unregister_metric_source(&self.tag);
+                    return Err(error);
+                }
+            };
+            *self
+                .prefetch_task_handle
+                .lock()
+                .expect("prefetch_task_handle poisoned") = Some(prefetch_task_handle);
+        }
+
         Ok(())
     }
 
@@ -1336,11 +1631,19 @@ impl Plugin for Cache {
             .lock()
             .expect("cleanup_task_handle poisoned")
             .take();
+        let prefetch_task_handle = self
+            .prefetch_task_handle
+            .lock()
+            .expect("prefetch_task_handle poisoned")
+            .take();
 
         if let Some(handle) = dump_task_handle {
             handle.stop().await;
         }
         if let Some(handle) = cleanup_task_handle {
+            handle.stop().await;
+        }
+        if let Some(handle) = prefetch_task_handle {
             handle.stop().await;
         }
         if let Some(dump_file) = &self.config.dump_file
@@ -1373,6 +1676,17 @@ impl Executor for Cache {
         let Some(cache_map) = self.cache_map.get() else {
             return continue_next!(next, context);
         };
+
+        // Capture the ingress and downstream chain once so the prefetch scanner
+        // can drive refreshes outside a client request.
+        if self.prefetch.is_some() && self.prefetch_template.get().is_none() {
+            if let Some(next) = next.as_ref() {
+                let _ = self.prefetch_next.set(next.clone());
+            }
+            let _ = self
+                .prefetch_template
+                .set(PrefetchTemplate::from_context(context));
+        }
 
         let cache_lookup = self.try_cache_hit(context, cache_map);
         let cache_hit = cache_lookup
@@ -1617,6 +1931,10 @@ fn parse_cache_config(args: Option<Value>) -> Result<CacheConfig> {
         max_positive_ttl: None,
         min_positive_ttl: None,
         ecs_in_key: None,
+        prefetch: None,
+        prefetch_before_expire: None,
+        prefetch_min_hits: None,
+        prefetch_scan_interval: None,
     })
 }
 
@@ -1676,6 +1994,22 @@ fn validate_cache_config(config: &CacheConfig) -> Result<()> {
         ));
     }
 
+    if let Some(percent) = config.prefetch_before_expire
+        && !(1..=99).contains(&percent)
+    {
+        return Err(DnsError::plugin(
+            "cache prefetch_before_expire must be between 1 and 99",
+        ));
+    }
+
+    if let Some(interval) = config.prefetch_scan_interval
+        && interval == 0
+    {
+        return Err(DnsError::plugin(
+            "cache prefetch_scan_interval must be greater than 0",
+        ));
+    }
+
     Ok(())
 }
 
@@ -1705,6 +2039,7 @@ impl PluginFactory for CacheFactory {
 impl CacheFactory {
     fn build_cache(&self, tag: String, cache_config: CacheConfig) -> Result<UninitializedPlugin> {
         let metrics = Arc::new(CacheMetrics::new(tag.clone()));
+        let prefetch = PrefetchSettings::from_config(&cache_config);
         Ok(UninitializedPlugin::Executor(Box::new(Cache {
             cache_map: OnceCell::new(),
             tag,
@@ -1723,6 +2058,10 @@ impl CacheFactory {
             metrics,
             dump_task_handle: Mutex::new(None),
             cleanup_task_handle: Mutex::new(None),
+            prefetch,
+            prefetch_task_handle: Mutex::new(None),
+            prefetch_template: Arc::new(OnceLock::new()),
+            prefetch_next: Arc::new(OnceLock::new()),
             lazy_refresh_inflight: Arc::new(Mutex::new(AHashSet::new())),
             next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
@@ -1759,6 +2098,10 @@ fn parse_cache_quick_setup(raw: &str) -> Result<CacheConfig> {
         max_positive_ttl: None,
         min_positive_ttl: None,
         ecs_in_key: None,
+        prefetch: None,
+        prefetch_before_expire: None,
+        prefetch_min_hits: None,
+        prefetch_scan_interval: None,
     };
 
     for token in raw.split_whitespace() {
@@ -1835,12 +2178,16 @@ mod tests {
             negative_ttl_without_soa,
             short_circuit,
             ecs_in_key,
+            prefetch: PrefetchSettings::from_config(&config),
             config,
             updated_keys: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(CacheMetrics::new("cache_test".to_string())),
             cache_size,
             dump_task_handle: Mutex::new(None),
             cleanup_task_handle: Mutex::new(None),
+            prefetch_task_handle: Mutex::new(None),
+            prefetch_template: Arc::new(OnceLock::new()),
+            prefetch_next: Arc::new(OnceLock::new()),
             lazy_refresh_inflight: Arc::new(Mutex::new(AHashSet::new())),
             next_inline_maintenance_ms: AtomicU64::new(0),
             touch_interval_ms: AtomicU64::new(0),
@@ -1861,6 +2208,10 @@ mod tests {
             max_positive_ttl: None,
             min_positive_ttl: None,
             ecs_in_key: None,
+            prefetch: None,
+            prefetch_before_expire: None,
+            prefetch_min_hits: None,
+            prefetch_scan_interval: None,
         }
     }
 
@@ -3466,6 +3817,10 @@ mod tests {
             max_positive_ttl: None,
             min_positive_ttl: None,
             ecs_in_key: None,
+            prefetch: None,
+            prefetch_before_expire: None,
+            prefetch_min_hits: None,
+            prefetch_scan_interval: None,
         };
 
         assert!(validate_cache_config(&cfg).is_err());
@@ -3477,6 +3832,40 @@ mod tests {
         cfg.min_positive_ttl = Some(0);
 
         assert!(validate_cache_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_out_of_range_prefetch_before_expire() {
+        for invalid in [0u8, 100] {
+            let mut cfg = default_test_config();
+            cfg.prefetch = Some(true);
+            cfg.prefetch_before_expire = Some(invalid);
+
+            assert!(
+                validate_cache_config(&cfg).is_err(),
+                "prefetch_before_expire={invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_prefetch_scan_interval() {
+        let mut cfg = default_test_config();
+        cfg.prefetch = Some(true);
+        cfg.prefetch_scan_interval = Some(0);
+
+        assert!(validate_cache_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_accepts_prefetch_bounds() {
+        let mut cfg = default_test_config();
+        cfg.prefetch = Some(true);
+        cfg.prefetch_before_expire = Some(99);
+        cfg.prefetch_scan_interval = Some(1);
+        cfg.prefetch_min_hits = Some(0);
+
+        assert!(validate_cache_config(&cfg).is_ok());
     }
 
     #[test]
